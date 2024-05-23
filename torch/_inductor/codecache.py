@@ -656,11 +656,11 @@ class FxGraphHashDetails:
         self.system_info = CacheBase.get_system()
 
         try:
-            self.inductor_config = config.save_config()
+            self.inductor_config = config.save_config_portable()
         except (TypeError, AttributeError) as e:
             # Some configs options are callables, e.g., post_grad_custom_pre_pass,
             # and may not pickle.
-            log.debug("Can't pickle inductor config: %s", e)
+            log.warning("Can't pickle inductor config", exc_info=True)
             raise BypassFxGraphCache from e
 
     def debug_str(self) -> str:
