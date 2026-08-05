@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch._dynamo.utils import same
 from torch._inductor import metrics, utils
+from torch._inductor.codegen.triton import TritonKernel
+from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.runtime.triton_heuristics import persistent_reduction
 from torch._inductor.scheduler import MixOrderReduction
 from torch._inductor.test_case import run_tests, TestCase
@@ -412,12 +414,11 @@ class MixOrderReductionTest(TestBase):
         With TMA enabled, the mix-order reduction loop used to leave the scalar
         `xoffset` (which TMA descriptors index off) frozen while only advancing
         the `xindex` tensor, so every loop iteration read/wrote the first tile
-        and produced wrong results. Additionally NUM_STAGES >= 3 with TMA active
-        triggers a misaligned-address crash, so the heuristic caps stages at 2.
+        and produced wrong results. Triton cannot pipeline device-side tensor
+        map creation, so these kernels use one stage.
 
-        ``allow_multi_stages=True`` exercises the multi-stage path that
-        previously crashed (now capped at NUM_STAGES=2 with TMA); ``False``
-        disables multi-staging entirely as a sanity check.
+        ``allow_multi_stages=True`` verifies that device-side TMA still forces
+        NUM_STAGES=1; ``False`` disables multi-staging globally as a sanity check.
         """
         if not inductor_config.triton.mix_order_reduction:
             self.skipTest("Mix order reduction not enabled")
@@ -463,7 +464,13 @@ class MixOrderReductionTest(TestBase):
         if inductor_config.triton.mix_order_reduction:
             # The fix advances the scalar xoffset inside the mix-order loop so
             # TMA descriptors point at the right tile each iteration.
-            FileCheck().check("xoffset += XBLOCK").run(bwd_wrapper)
+            (
+                FileCheck()
+                .check("'uses_tma': True")
+                .check("'uses_device_tma': True")
+                .check("xoffset += XBLOCK")
+                .run(bwd_wrapper)
+            )
 
     @unittest.skipUnless(
         has_triton_tma_device(), "Test requires Triton TMA device support"
@@ -531,7 +538,13 @@ class MixOrderReductionTest(TestBase):
             metrics.codegen_mix_order_reduction,
         )
         if inductor_config.triton.mix_order_reduction:
-            FileCheck().check("xoffset += XBLOCK").run(bwd_wrapper)
+            (
+                FileCheck()
+                .check("'uses_tma': True")
+                .check("'uses_device_tma': True")
+                .check("xoffset += XBLOCK")
+                .run(bwd_wrapper)
+            )
 
     @parametrize(
         "wbdtype",
@@ -1422,7 +1435,21 @@ class MixOrderReductionHeuristicTest(TestBase):
     ``return_configs=True``) without needing a GPU.
     """
 
-    def _gen_num_stages(self, *, tma, allow_multi_stages, rsplit_size=256, rnumel=256):
+    def test_uses_tma_tracks_emitted_descriptors(self):
+        for source in (None, "host", "device"):
+            with self.subTest(source=source):
+                kernel = object.__new__(TritonKernel)
+                host_descriptors = {}
+                if source == "host":
+                    host_descriptors["arg"] = mock.sentinel.descriptor
+                kernel.host_tma_descriptor_args = host_descriptors
+                kernel._emitted_device_tma = source == "device"
+                self.assertEqual(kernel.uses_tma, source is not None)
+                self.assertEqual(kernel.uses_device_tma, source == "device")
+
+    def _gen_num_stages(
+        self, *, tma, allow_multi_stages, device_tma=False, rsplit_size=256, rnumel=256
+    ):
         """
         Drive the mix-order branch of persistent_reduction and return the set of
         NUM_STAGES values across the generated configs.
@@ -1432,34 +1459,35 @@ class MixOrderReductionHeuristicTest(TestBase):
             "mix_order_reduction_allow_multi_stages": allow_multi_stages,
         }
         if tma:
-            # XBLOCK is not a reduction prefix, so it survives the persistent
-            # reduction filtering and marks TMA as active.
-            inductor_meta["tma_min_block_sizes"] = {"XBLOCK": 8}
+            inductor_meta["uses_tma"] = True
+        if device_tma:
+            inductor_meta["uses_device_tma"] = True
         configs = persistent_reduction(
             {"x": 4096, "r0_": rnumel},
-            triton_meta={"device": torch.device("cpu")},
+            triton_meta={
+                "device": DeviceProperties(
+                    type="cpu", index=0, multi_processor_count=1, cc=0
+                )
+            },
             inductor_meta=inductor_meta,
             return_configs=True,
         )
         self.assertTrue(configs, "expected at least one config")
         return {c.kwargs["NUM_STAGES"] for c in configs}
 
-    def test_tma_caps_num_stages(self):
-        """
-        Regression test for https://github.com/pytorch/pytorch/issues/186241
-        (part 2). With TMA active, NUM_STAGES >= 3 triggers a misaligned-address
-        crash, so the heuristic must cap it at 2. Without TMA the same shape is
-        allowed to pick NUM_STAGES=3.
-        """
-        # rnumel <= 8192 and num_iters // 4 >= 3 lets the non-TMA path reach 3.
-        no_tma = self._gen_num_stages(tma=False, allow_multi_stages=True)
-        self.assertIn(3, no_tma, f"expected NUM_STAGES=3 without TMA, got {no_tma}")
-
-        with_tma = self._gen_num_stages(tma=True, allow_multi_stages=True)
-        self.assertTrue(
-            all(s <= 2 for s in with_tma),
-            f"NUM_STAGES must be capped at 2 with TMA, got {with_tma}",
+    def test_num_stages_support_matrix(self):
+        cases = (
+            ("no TMA", False, False, {3}),
+            ("device TMA", True, True, {1}),
         )
+        for name, tma, device_tma, expected in cases:
+            with self.subTest(name):
+                stages = self._gen_num_stages(
+                    tma=tma,
+                    device_tma=device_tma,
+                    allow_multi_stages=True,
+                )
+                self.assertEqual(stages, expected)
 
     def test_num_stages_single_when_multi_stage_disabled(self):
         """
@@ -1470,27 +1498,17 @@ class MixOrderReductionHeuristicTest(TestBase):
             stages = self._gen_num_stages(tma=tma, allow_multi_stages=False)
             self.assertEqual(stages, {1}, f"tma={tma}: expected {{1}}, got {stages}")
 
-    def test_tma_caps_num_stages_across_shapes(self):
-        """
-        The NUM_STAGES cap with TMA must hold for every (rsplit_size, rnumel)
-        combination the heuristic can produce, not just the shape from the
-        original issue: the underlying failure (triton-lang/triton#10474) is in
-        Triton's software pipeliner for in-loop tensor descriptors, independent
-        of the tile shape.
-        """
+    def test_device_tma_disables_multi_stages_across_shapes(self):
         for rsplit_size in (16, 64, 128, 256):
             for rnumel in (256, 1024, 8192, 16384):
                 stages = self._gen_num_stages(
                     tma=True,
+                    device_tma=True,
                     allow_multi_stages=True,
                     rsplit_size=rsplit_size,
                     rnumel=rnumel,
                 )
-                self.assertTrue(
-                    all(s <= 2 for s in stages),
-                    f"rsplit_size={rsplit_size}, rnumel={rnumel}: "
-                    f"NUM_STAGES must be capped at 2 with TMA, got {stages}",
-                )
+                self.assertEqual(stages, {1})
 
 
 @inductor_config.patch(
