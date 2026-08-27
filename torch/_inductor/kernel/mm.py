@@ -400,7 +400,7 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
         mat1, mat2, layout=layout, out_dtype=out_dtype
     )
 
-    if out_dtype is None and _use_small_mm_pointwise(m, k, n, layout):
+    if out_dtype is None and _use_small_mm_pointwise(m, k, n, layout.device.type):
         counters["inductor"]["decompose_mm_pointwise"] += 1
         mat1 = L.unsqueeze(mat1, -1)
         mat2 = L.unsqueeze(mat2, 0)
@@ -452,7 +452,7 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
         # Triton will ever win.
         #
         # To be conservative we increase this threshold for N/M by 2.
-        is_exhaustive = inductor_config.max_autotune_gemm_search_space == "exhaustive"
+        is_exhaustive = inductor_config.max_autotune_gemm_search_space == "EXHAUSTIVE"
         if is_exhaustive or not use_decompose_k_choice(m, n, k, threshold_multiple=2):
             templates_to_use.append(mm_template)
 
@@ -1159,12 +1159,13 @@ def tuned_scaled_mm_v2(
         ScalingType(recipe_b[0]),
     )
 
+    bias_real = realize_inputs(bias) if bias else None
+
     input_nodes: list[Any]
 
     if not bias:
         input_nodes = [mat_a, mat_b, scale_a_real, scale_b_real]
     else:
-        bias_real = realize_inputs(bias)
         input_nodes = [mat_a, mat_b, scale_a_real, scale_b_real, bias_real]
 
     # Create MMKernelInputs for Scaled MM (matrices are at indices 0, 1)
@@ -1367,12 +1368,13 @@ def tuned_scaled_mm(
 
     scale_a_real, scale_b_real = realize_inputs(scale_a, scale_b)
 
+    bias_real = realize_inputs(bias) if bias else None
+
     input_nodes: list[Any]
 
     if not bias:
         input_nodes = [mat_a, mat_b, scale_a_real, scale_b_real]
     else:
-        bias_real = realize_inputs(bias)
         input_nodes = [mat_a, mat_b, scale_a_real, scale_b_real, bias_real]
 
     # Create MMKernelInputs for Scaled MM (matrices are at indices 0, 1)
